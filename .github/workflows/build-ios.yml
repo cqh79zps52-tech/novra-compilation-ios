@@ -1,0 +1,297 @@
+# COMPILER iOS SANS RIEN PAYER — DEPOT PUBLIC JETABLE.
+#
+# ⚠️⚠️ POURQUOI UN DEPOT A PART (2026-09-21). Le budget GitHub Actions du compte
+# est a zero : sur un depot PRIVE, aucune machine n'est attribuee et le flux
+# echoue en deux secondes sans une etape. Sur un depot PUBLIC, les machines
+# standard — macOS comprise — sont gratuites et illimitees, et le plafond de
+# depense ne s'y applique pas. C'est la seule difference entre les deux, et elle
+# vaut neuf jours d'attente.
+#
+# ⚠️ CE DEPOT NE CONTIENT PAS UNE LIGNE DE NOVRA. Il va chercher le code du
+# depot prive avec une cle de deploiement en LECTURE SEULE, posee dans le secret
+# `NOVRA_SSH_KEY`. Le code ne devient donc jamais public ; ce qui l'est, c'est le
+# journal de compilation et le binaire attache a la release. Les deux se
+# suppriment avec le depot une fois le binaire recupere.
+#
+# ⚠️⚠️ POURQUOI (2026-09-20). Les 15 compilations iOS du mois offertes par le
+# plan gratuit d'Expo sont epuisees jusqu'au 1er octobre, et l'iMac ne peut pas
+# compiler : il plafonne a macOS 14, donc Swift 6.0, quand le projet reclame
+# Swift 6.2. La machine macOS de GitHub porte **macOS 26.6, Xcode 26.6 et Swift
+# 6.3.3** — mesure le meme jour. Et `eas build --local` compile sur la machine
+# qui l'execute : il ne consomme AUCUN build du quota d'Expo.
+#
+# ⚠️ UN SEUL SECRET, ET PAS LA CLE APPLE. Ce flux s'arrete au binaire et le
+# depose en artefact ; la soumission se fait depuis le Mac, ou la cle `.p8` vit
+# deja. La mettre ici ajouterait un endroit ou un secret Apple peut fuir, pour
+# economiser une commande.
+#
+# ⚠️⚠️ CE QUI PROTEGE LES MINUTES DE LUCAS, ET C'EST LE POINT DE CE FICHIER.
+# Le depot est prive : une minute macOS est comptee DIX fois sur l'allocation
+# mensuelle. Une heure de compilation vaut donc ~600 des 2000 minutes offertes,
+# et un essai voue a l'echec les brule aussi surement qu'un essai reussi. Trois
+# choses l'empechent :
+#   1. un controle prealable sur Linux (compte x1, ~1 min) valide le jeton, le
+#      projet et le profil ; la machine macOS ne demarre que s'il passe ;
+#   2. rien ne se declenche tout seul — ni `push`, ni `pull_request` : il faut
+#      poser une etiquette `build-ios-*` ou appuyer sur le bouton ;
+#   3. `concurrency` annule l'essai precedent, et le plafond de temps est cale
+#      juste au-dessus de la duree attendue au lieu du maximum de GitHub.
+name: compiler iOS (depot public, machine macOS gratuite)
+
+on:
+  # ⚠️ RIEN NE SE DECLENCHE TOUT SEUL, ET C'EST CE QUI REND CE DEPOT PUBLIC SUR.
+  # `workflow_dispatch` exige le droit d'ecriture sur le depot : un visiteur ne
+  # peut pas lancer la compilation, et un fork qui ouvre une PR n'a jamais acces
+  # aux secrets — GitHub ne les sert pas aux flux venus d'un fork.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branche du depot prive a compiler"
+        required: false
+        default: landing/la-route
+      profil:
+        description: "Profil EAS a compiler"
+        required: false
+        default: production
+
+# Deux essais lances coup sur coup ne paient pas deux fois.
+concurrency:
+  group: build-ios
+  cancel-in-progress: true
+
+jobs:
+  # ── 1. LA PORTE, SUR UNE MACHINE QUI NE COUTE PRESQUE RIEN ────────────────
+  verifier:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 10
+    outputs:
+      profil: ${{ steps.choix.outputs.profil }}
+      etiquette: ${{ steps.choix.outputs.etiquette }}
+    steps:
+      # ⚠️ LE CODE VIENT DU DEPOT PRIVE, PAS D'ICI. `actions/checkout` ne sait
+      # cloner que le depot courant, qui ne porte que ce fichier.
+      - name: Aller chercher le code du depot prive
+        working-directory: ${{ github.workspace }}
+        env:
+          CLE: ${{ secrets.NOVRA_SSH_KEY }}
+          REF: ${{ inputs.ref || 'main' }}
+        run: |
+          if [ -z "$CLE" ]; then
+            echo "::error::Le secret NOVRA_SSH_KEY manque."; exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$CLE" > ~/.ssh/novra && chmod 600 ~/.ssh/novra
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/novra -o IdentitiesOnly=yes"
+          git clone --depth 1 --branch "$REF" \
+            git@github.com:cqh79zps52-tech/novra.git depot
+          # ⚠️ ON DEPLACE AU LIEU DE CLONER SUR PLACE : un `git clone .` refuse
+          # un dossier non vide, et le dossier de travail porte deja ce flux.
+          shopt -s dotglob && mv depot/* . && rmdir depot
+          git log -1 --format='code compile : %h %s'
+
+      # ⚠️ LE JETON D'ABORD, ET SANS RIEN INSTALLER. C'est le manque le plus
+      # probable, et le seul qui se lise en une seconde.
+      - name: Le jeton Expo est-il la
+        run: |
+          if [ -z "${{ secrets.EXPO_TOKEN }}" ]; then
+            echo "::error::Le secret EXPO_TOKEN manque. Cree un jeton sur"
+            echo "::error::https://expo.dev/settings/access-tokens puis ajoute-le"
+            echo "::error::dans Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - id: choix
+        run: |
+          echo "profil=${{ inputs.profil || 'production' }}" >> "$GITHUB_OUTPUT"
+          echo "etiquette=build-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # ⚠️ ON DEMANDE A EXPO QUI ON EST, PUIS CE QU'IL SAIT DU PROJET. Un jeton
+      # revoque, expire ou colle avec un espace en trop echoue ICI, pour une
+      # minute facturee une fois — pas au milieu d'une compilation macOS.
+      - name: Le jeton ouvre-t-il vraiment le compte
+        working-directory: app
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          qui=$(npx --yes eas-cli whoami 2>&1) || {
+            echo "::error::Le jeton ne donne acces a aucun compte : $qui"; exit 1; }
+          echo "compte : $qui"
+
+      # ⚠️ ET QUE LE PROFIL DEMANDE EXISTE. Un nom mal tape lancerait la machine
+      # macOS pour rien.
+      # ⚠️ LE NOM PASSE PAR L'ENVIRONNEMENT, PAS PAR LE TEXTE DU SCRIPT. Ecrit
+      # en dur dans un `node -e "..."`, il ramene des guillemets imbriques —
+      # et une erreur de syntaxe ici gacherait justement l'essai qu'on protege.
+      - name: Le profil demande existe-t-il
+        working-directory: app
+        env:
+          PROFIL: ${{ steps.choix.outputs.profil }}
+        run: |
+          node -e '
+            const p = process.env.PROFIL;
+            const j = require("./eas.json");
+            if (!j.build || !j.build[p]) {
+              console.error("::error::Le profil " + p + " est absent de eas.json");
+              console.error("Profils connus : " + Object.keys(j.build || {}).join(", "));
+              process.exit(1);
+            }
+            console.log("profil " + p + " : " + JSON.stringify(j.build[p]));
+          '
+
+      # ⚠️⚠️ ON PROUVE QU'ON POURRA DEPOSER LE BINAIRE, AVANT DE LE FABRIQUER.
+      # Le premier essai a compile trente minutes puis perdu le fichier sur un
+      # « Artifact storage quota has been hit » — un mur qu'on aurait rencontre
+      # ici, pour une minute facturee une fois. Ce depot d'essai coute quelques
+      # octets et repond a la seule question qui restait : a-t-on le droit et la
+      # place d'ecrire ?
+      - name: Peut-on vraiment deposer un fichier
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ETIQUETTE: ${{ needs.verifier.outputs.etiquette || format('build-{0}', github.run_id) }}
+        run: |
+          echo "essai de depot $(date -u +%FT%TZ)" > pret.txt
+          gh release create "$ETIQUETTE" --repo "$GITHUB_REPOSITORY" \
+            --title "Binaire iOS — $ETIQUETTE" \
+            --notes "Compile sur une machine macOS de GitHub, sans entamer le quota d'Expo." \
+            2>/dev/null || echo "la release existait deja"
+          gh release upload "$ETIQUETTE" pret.txt --repo "$GITHUB_REPOSITORY" --clobber
+          vu=$(gh release view "$ETIQUETTE" --repo "$GITHUB_REPOSITORY" --json assets \
+                 --jq '[.assets[] | select(.name=="pret.txt")] | length')
+          [ "$vu" = "1" ] || { echo "::error::le depot d'essai n'est pas arrive"; exit 1; }
+          echo "depot possible"
+
+  # ── 2. LA COMPILATION, QUI NE DEMARRE QUE DERRIERE LA PORTE ───────────────
+  compiler:
+    needs: verifier
+    runs-on: macos-latest
+    # Ecrire une release demande ce droit ; le jeton par defaut ne l'a pas.
+    permissions:
+      contents: write
+    # ⚠️ 75 MINUTES, PAS LES 360 DE GITHUB. Un processus qui se bloque
+    # consommerait sinon 3600 minutes facturables — soit bien plus que
+    # l'allocation mensuelle entiere, en une seule fois.
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      # ⚠️ LE CODE VIENT DU DEPOT PRIVE, PAS D'ICI. `actions/checkout` ne sait
+      # cloner que le depot courant, qui ne porte que ce fichier.
+      - name: Aller chercher le code du depot prive
+        working-directory: ${{ github.workspace }}
+        env:
+          CLE: ${{ secrets.NOVRA_SSH_KEY }}
+          REF: ${{ inputs.ref || 'main' }}
+        run: |
+          if [ -z "$CLE" ]; then
+            echo "::error::Le secret NOVRA_SSH_KEY manque."; exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$CLE" > ~/.ssh/novra && chmod 600 ~/.ssh/novra
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/novra -o IdentitiesOnly=yes"
+          git clone --depth 1 --branch "$REF" \
+            git@github.com:cqh79zps52-tech/novra.git depot
+          # ⚠️ ON DEPLACE AU LIEU DE CLONER SUR PLACE : un `git clone .` refuse
+          # un dossier non vide, et le dossier de travail porte deja ce flux.
+          shopt -s dotglob && mv depot/* . && rmdir depot
+          git log -1 --format='code compile : %h %s'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Ce que porte cette machine
+        run: |
+          sw_vers | tr '\n' ' '; echo
+          xcodebuild -version | tr '\n' ' '; echo
+          swift --version 2>&1 | head -1
+
+      - run: npm ci
+
+      - name: Compiler sur cette machine
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          npx --yes eas-cli build \
+            --platform ios \
+            --profile "${{ needs.verifier.outputs.profil }}" \
+            --local \
+            --non-interactive \
+            --output "$RUNNER_TEMP/novra.ipa"
+
+      # ⚠️ UN BINAIRE ABSENT OU MINUSCULE EST UN ECHEC, MEME SI LA COMMANDE
+      # REND 0. C'est le mode de panne par defaut : un succes indiscernable
+      # d'un echec (CLAUDE.md §3.11).
+      - name: Le binaire existe-t-il vraiment
+        run: |
+          f="$RUNNER_TEMP/novra.ipa"
+          [ -f "$f" ] || { echo "::error::aucun .ipa produit"; exit 1; }
+          taille=$(stat -f%z "$f")
+          echo "binaire : $taille octets"
+          [ "$taille" -gt 5000000 ] || { echo "::error::binaire suspect ($taille octets)"; exit 1; }
+
+      # ⚠️⚠️ UNE *RELEASE*, PAS UN ARTEFACT (2026-09-20). Le premier essai a
+      # compile pendant trente minutes, produit le binaire... et l'a perdu a la
+      # derniere seconde : « Artifact storage quota has been hit ». Ce quota est
+      # compte pour TOUT le compte et se recalcule toutes les 6 a 12 heures —
+      # impossible a liberer au moment ou on en a besoin, et le compte ne
+      # stockait pourtant aucun artefact. Les fichiers attaches a une release
+      # ne passent pas par ce compteur.
+      #
+      # ⚠️ ET ON RELIT LA RELEASE APRES L'AVOIR ECRITE. Un depot qui echoue
+      # sans faire echouer l'etape nous ferait croire le binaire en securite —
+      # c'est exactement ce qui vient de couter une demi-heure de machine.
+      # ⚠️⚠️ LA FICHE QUI DIT A QUOI CE BINAIRE CORRESPOND. Un build compile en
+      # local n'est enregistre NULLE PART chez Expo : `build:list` l'ignore. Sans
+      # cette fiche, la porte des mises a jour (`outils/maj.mjs`) compare le code
+      # au dernier build CLOUD — le 40 du 15 septembre — et refuse des mises a
+      # jour parfaitement valides en accusant le code. Un refus qui a l'air d'un
+      # verdict.
+      #
+      # ⚠️ ELLE SE FABRIQUE ICI, PAS A LA MAIN. Ecrite apres coup, elle serait
+      # juste une fois et fausse au build suivant : le numero et l'empreinte
+      # changent a chaque fois, et personne ne repasse derriere.
+      - name: Ecrire la fiche du binaire
+        run: |
+          emp=$(npx --yes expo-updates fingerprint:generate --platform ios \
+                | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+                    const a=s.indexOf("{"),b=s.lastIndexOf("}");
+                    process.stdout.write(JSON.parse(s.slice(a,b+1)).hash);})')
+          d=$(mktemp -d); unzip -q -o "$RUNNER_TEMP/novra.ipa" -d "$d"
+          plist="$d/Payload/novra.app/Info.plist"
+          num=$(plutil -extract CFBundleVersion raw "$plist")
+          ver=$(plutil -extract CFBundleShortVersionString raw "$plist")
+          rt=$(plutil -extract EXUpdatesRuntimeVersion raw "$d/Payload/novra.app/Expo.plist")
+          node -e '
+            const [emp,num,ver,rt] = process.argv.slice(1);
+            require("fs").writeFileSync(process.env.RUNNER_TEMP + "/empreinte.json",
+              JSON.stringify({ numero: Number(num), canal: "production", empreinte: emp,
+                version_app: ver, version_execution: rt,
+                compile_le: new Date().toISOString().slice(0,10),
+                venu_de: "machine macOS de GitHub" }, null, 1));
+          ' "$emp" "$num" "$ver" "$rt"
+          cat "$RUNNER_TEMP/empreinte.json"
+
+      - name: Deposer le binaire dans une release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ETIQUETTE: ${{ needs.verifier.outputs.etiquette || format('build-{0}', github.run_id) }}
+        run: |
+          f="$RUNNER_TEMP/novra.ipa"
+          gh release upload "$ETIQUETTE" "$f#novra.ipa" \
+            "$RUNNER_TEMP/empreinte.json#empreinte.json" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          vu=$(gh release view "$ETIQUETTE" --repo "$GITHUB_REPOSITORY" --json assets \
+                 --jq '[.assets[] | select(.name=="novra.ipa") | .size] | add // 0')
+          echo "depose : $vu octets"
+          [ "$vu" -gt 5000000 ] || { echo "::error::la release ne porte pas le binaire"; exit 1; }
