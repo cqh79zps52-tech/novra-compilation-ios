@@ -272,13 +272,19 @@ jobs:
           num=$(plutil -extract CFBundleVersion raw "$plist")
           ver=$(plutil -extract CFBundleShortVersionString raw "$plist")
           rt=$(plutil -extract EXUpdatesRuntimeVersion raw "$d/Payload/novra.app/Expo.plist")
+          # ⚠️ LE COMMIT DU CODE COMPILE. Sans lui, la porte des mises a jour ne
+          # peut pas rejouer l'empreinte ici (elle n'est pas portable entre
+          # machines) et reste fermee : le build 52 l'a prouve le 2026-09-22.
+          export COMMIT_DU_CODE=$(git rev-parse HEAD)
+          [ ${#COMMIT_DU_CODE} -eq 40 ] || { echo "::error::commit du code introuvable"; exit 1; }
           node -e '
             const [emp,num,ver,rt] = process.argv.slice(1);
             require("fs").writeFileSync(process.env.RUNNER_TEMP + "/empreinte.json",
               JSON.stringify({ numero: Number(num), canal: "production", empreinte: emp,
                 version_app: ver, version_execution: rt,
                 compile_le: new Date().toISOString().slice(0,10),
-                venu_de: "machine macOS de GitHub" }, null, 1));
+                venu_de: "machine macOS de GitHub",
+                commit: process.env.COMMIT_DU_CODE }, null, 1));
           ' "$emp" "$num" "$ver" "$rt"
           cat "$RUNNER_TEMP/empreinte.json"
 
